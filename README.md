@@ -1,1 +1,288 @@
-# Pepepeepz
+# Whack-a-Pepe: Market Panic
+
+A whack-a-mole whitelist game for the Pepe collection. A live `$PEPE` chart runs behind the board. Whack a Pepe and the coin pumps. Tap the wrong thing and it dumps. Pump it to **100x** before you burn all 5 chances, or climb the leaderboard, to earn a mint spot.
+
+> Status: design spec. Numbers marked **(tunable)** live in one config file so they can be rebalanced without touching game logic.
+
+---
+
+## 1. Game at a glance
+
+| | |
+|---|---|
+| Board | 6 holes (3 columns x 2 rows), `$PEPE` price chart rendered behind it |
+| Goal | Reach **100x** on the coin, or finish high on the leaderboard |
+| Chances | 5 misses allowed. The 5th miss ends the run with **"You rugged"** |
+| Clock | None. Pace speeds up as you hit more |
+| Login | X (Twitter) via Supabase Auth, required to play |
+| Score | **100 points per successful whack** |
+
+---
+
+## 2. Rules
+
+### 2.1 Characters
+
+| Character | Behavior | If you tap it |
+|---|---|---|
+| **Pepe** | Pops up, stays briefly, ducks back down | **Hit.** +100 points, coin pumps |
+| **Faker** | A Pepe that peeks up and ducks almost instantly, then reappears in a different hole | Tapping the hole it left is a **miss** |
+| **Rug Dev** | Hooded decoy that pops up like a Pepe | **Miss.** Coin dumps, costs a chance |
+| *Empty hole* | Nothing there | **Miss** |
+
+A Pepe that ducks back down un-whacked is **not** a miss. Only taps count as misses.
+
+### 2.2 Price model
+
+- **Hit:** price x **1.11** (tunable)
+- **Miss:** price x **0.80** (tunable)
+- Start price: **1.00x**. Win at **100.00x**.
+
+Resulting balance:
+
+- Clean run: ln(100) / ln(1.11) is about **45 hits** to reach 100x.
+- Each miss costs about 2.1 extra hits to recover, so a run using all 5 chances needs about **55 hits**.
+- This fits the target of 40-50 hits for a good run.
+
+### 2.3 Run end states
+
+| State | Trigger | Result |
+|---|---|---|
+| **Completed** | Price reaches 100x | Win screen, wallet submission unlocked, score banked |
+| **Rugged** | 5th miss | Chart crashes, "You rugged" screen, score banked |
+
+Reaching 100x ends the run immediately. The score is whatever was earned up to that point (about 4,500 or more).
+
+### 2.4 Pace (difficulty ramp)
+
+The game has no timer. Difficulty is a function of **hits so far**, so slow players are never punished by a clock and fast players are never stuck.
+
+| Parameter | Formula (tunable) |
+|---|---|
+| Pepe up-time | `max(350 ms, 1100 - 15 x hits)` |
+| Gap between spawns | `max(250 ms, 700 - 10 x hits)` |
+| Faker chance | 0% until hit 10, rising to a cap of 25% |
+| Rug Dev chance | 0% until hit 5, rising from 8% to a cap of 25% |
+| Simultaneous characters | 1 until hit 25, then up to 2 |
+
+---
+
+## 3. Scoring and leaderboard
+
+- **100 points per successful whack.** Misses give 0 points and don't subtract.
+- A player can have many runs. Their **best score** counts on the leaderboard.
+- Tie-break: the run that reached the score **earlier** ranks higher.
+- The leaderboard shows rank, X handle, best score, and best multiplier reached.
+- Scores are written **only by the server** after run validation (section 6). The client never writes a score.
+
+> Assumption: "each tap gives 100 points" means each successful whack. If misses should score too, change one constant.
+
+---
+
+## 4. Two ways to win
+
+### Path A: Top 1000 on the leaderboard
+- At season end (a timestamp stored in `config`), the leaderboard is **frozen**.
+- The top **1,000** X accounts by best score each get a mint spot.
+- Winners submit a wallet address in a claim window after the freeze.
+
+### Path B: Complete the game
+- Reach **100x** in a single run.
+- Submit a wallet immediately on the win screen (or later from the profile page).
+- This earns a **guaranteed mint spot**, no matter where you finish on the leaderboard.
+
+### Rules for both
+- **One mint spot per X account.** Qualifying through both paths still gives one spot.
+- One spot per wallet address.
+- Spots are only granted to accounts that pass the eligibility checks in section 6.4.
+
+---
+
+## 5. Tech stack
+
+| Layer | Choice |
+|---|---|
+| Frontend | Vite + React + TypeScript (or a single HTML page for the prototype) |
+| Rendering | Canvas for the chart, DOM/CSS for the board |
+| Backend | Supabase: Postgres, Auth, Edge Functions |
+| Auth | Supabase X (Twitter) OAuth provider (check the current Supabase docs for the provider name and callback setup) |
+| Hosting | Any static host (Vercel, Netlify, Cloudflare Pages) |
+
+---
+
+## 6. Architecture and anti-cheat
+
+A browser game with a prize on the line will be attacked, so **the browser is never trusted**. It plays the game and reports what happened. The server decides whether it was legitimate.
+
+### 6.1 Run lifecycle
+
+1. Player signs in with X.
+2. Client calls the `start-run` edge function. The server creates a `runs` row with a random **seed** and `started_at`, and returns `{ run_id, seed }`.
+3. Client plays. The spawn sequence (which hole, which character, how long) is generated by a **deterministic PRNG** from `seed`, the spawn index, and the hit count so far. Client and server produce identical sequences.
+4. Client logs every tap as `{ t_ms, hole }` (time since run start).
+5. On run end, client calls `submit-run` with the tap log.
+6. The server **replays the log** against the regenerated spawn sequence, recomputes hits, misses, price, and score, and writes the final result only if the log is valid.
+
+### 6.2 Server validation checks
+
+- Every tap time falls inside a spawn window for that hole, or counts as a miss.
+- **Minimum reaction time:** no hit sooner than about 120 ms after a Pepe appears.
+- Tap rate is humanly possible (no more than a few taps per second, no perfectly regular intervals).
+- No taps after the run ended (5th miss or 100x).
+- Reported score and multiplier match the recomputed values.
+- Total run duration is consistent with the wall-clock gap between `start-run` and `submit-run` (with tolerance for latency).
+- Run is submitted once. A `run_id` can't be replayed.
+
+Runs that fail are stored with status `invalid` and excluded from the leaderboard.
+
+### 6.3 Rate limits
+- Max concurrent active runs per account: 1.
+- Cooldown between runs (suggested: 10 seconds) and a daily run cap (suggested: 100). **(tunable)**
+
+### 6.4 Eligibility (anti-bot)
+Applied before a mint spot is granted:
+- X account age of at least a minimum (suggested: 30 days).
+- Optional follower minimum and a "follow the project account" check.
+- Duplicate wallet detection and manual review for suspicious winners (for example, many accounts submitting one wallet).
+
+A bot that perfectly mimics human timing can still get through. Eligibility checks and manual review are the second line of defense.
+
+---
+
+## 7. Database schema (Supabase / Postgres)
+
+```sql
+-- Profile created on first X login
+create table profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  x_handle text not null,
+  x_user_id text unique not null,
+  x_created_at timestamptz,
+  created_at timestamptz default now()
+);
+
+create table runs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id),
+  seed text not null,
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  status text not null default 'active'
+    check (status in ('active','rugged','completed','invalid','abandoned')),
+  hits int default 0,
+  misses int default 0,
+  score int default 0,
+  final_multiplier numeric(8,2),
+  tap_log jsonb
+);
+
+create table mint_spots (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid unique not null references profiles(id),  -- one per X account
+  source text not null check (source in ('leaderboard','completion')),
+  wallet text unique not null,                           -- one per wallet
+  created_at timestamptz default now()
+);
+
+create table config (
+  key text primary key,
+  value jsonb not null   -- e.g. season_end, top_n, game constants
+);
+
+-- Public leaderboard: best valid run per player
+create view leaderboard as
+select distinct on (r.user_id)
+  p.x_handle, r.score, r.final_multiplier, r.ended_at
+from runs r
+join profiles p on p.id = r.user_id
+where r.status in ('rugged','completed')
+order by r.user_id, r.score desc, r.ended_at asc;
+```
+
+### Row Level Security
+- `profiles`: users read their own row. Handles are exposed publicly only through the `leaderboard` view.
+- `runs`: users can **read** their own runs. **No client insert/update.** Only edge functions (service role) write.
+- `mint_spots`: users read their own row. Inserts happen only through edge functions.
+- `config`: read-only for clients.
+
+---
+
+## 8. Edge functions
+
+| Function | Auth | Purpose |
+|---|---|---|
+| `start-run` | Required | Enforce rate limits, create run with seed, return `{ run_id, seed }` |
+| `submit-run` | Required | Replay and validate tap log, write score, set status, mark `completed` on 100x |
+| `claim-spot` | Required | Validate wallet format, check eligibility, enforce one spot per account and wallet, insert `mint_spots` row (path B immediately, path A after freeze) |
+| `freeze-season` | Admin / scheduled | Snapshot the top 1000 and open the claim window |
+
+---
+
+## 9. Frontend structure
+
+```
+src/
+  config.ts          # all tunable constants (price steps, pace curve, caps)
+  game/
+    prng.ts          # seeded deterministic PRNG, shared logic with the edge function
+    spawner.ts       # spawn schedule from (seed, index, hits)
+    engine.ts        # hits, misses, price, win/rug state
+  ui/
+    Board.tsx        # 6-hole grid (3x2), characters, tap handling
+    Chart.tsx        # canvas $PEPE price chart
+    Hud.tsx          # multiplier, score, remaining chances
+    Screens.tsx      # sign-in, win (wallet form), rugged, leaderboard
+  lib/
+    supabase.ts      # client + auth helpers
+    api.ts           # start-run, submit-run, claim-spot
+```
+
+The spawn logic in `prng.ts` / `spawner.ts` must be **identical** to the version used in the edge function. Keep it in a shared module or a copy-paste-tested package.
+
+---
+
+## 10. Setup
+
+1. Create a Supabase project.
+2. Enable the **X (Twitter)** provider under Authentication, with your X developer app's keys and the Supabase callback URL.
+3. Run the schema from section 7 and add the RLS policies.
+4. Deploy the edge functions (`start-run`, `submit-run`, `claim-spot`, `freeze-season`).
+5. Seed `config` with `season_end`, `top_n` (1000), and the game constants.
+6. Add environment variables to the frontend:
+
+```
+VITE_SUPABASE_URL=...
+VITE_SUPABASE_ANON_KEY=...
+```
+
+The service role key is used only inside edge functions and is never shipped to the browser.
+
+---
+
+## 11. Content notes
+
+- Pepe art is a placeholder. Swap in the collection art. Keep the Rug Dev clearly distinct from the Pepes so players can tell them apart at speed.
+- Keep copy fun and in-world: "You rugged," "To the moon," and so on.
+- Avoid Robinhood's name, logo, and branding in the game UI. Pepe's creator has also historically enforced copyright, so using your own original Pepe-style art is safer.
+- `$PEPE` in the game is a **fictional in-game price** and not a real token or financial product. Say so in the footer.
+
+---
+
+## 12. Open questions
+
+1. **Spot cap for Path B.** Completion gives a guaranteed spot with no ceiling. Decide whether total spots are capped (for example, 1,000 + a fixed number of completions) or uncapped.
+2. **Chain and wallet format.** Needed for wallet validation (EVM, Solana, etc.).
+3. **Season length.** When does the leaderboard freeze, and how long is the claim window?
+4. **Run limits.** Cooldown and daily cap values.
+5. **Eligibility thresholds.** X account age, follower minimum, required follow.
+6. **Decoy art.** Confirm the Rug Dev character.
+
+---
+
+## 13. Roadmap
+
+1. **Prototype:** single-file playable game with the full rule set, offline, fake leaderboard.
+2. **Backend:** schema, RLS, X auth, `start-run` / `submit-run` with replay validation.
+3. **Claim flow:** wallet submission, eligibility checks, `mint_spots`.
+4. **Launch:** leaderboard page, season freeze job, monitoring for abuse.
+5. **Post-launch:** review flagged winners, export final list for the mint contract.
